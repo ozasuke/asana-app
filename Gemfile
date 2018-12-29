@@ -1,5 +1,5 @@
 source 'https://rubygems.org'
 ruby '2.3.0'
-gem 'asana'
+gem 'asana', '0.8.0'
 gem 'pry'
 gem 'pry-doc'

@@ -24,17 +24,22 @@ module Asana::Resources
       end
       client.post("/tasks/#{id}/addProject", body: with_params, options: options) && true
     end
+
+    def subtasks(client, per_page: 20, options: {})
+      params = { limit: per_page }.reject { |_,v| v.nil? || Array(v).empty? }
+      Collection.new(parse(client.get("/tasks/#{id}/subtasks", params: params, options: options)), type: self.class, client: client)
+    end
   end
 end
 
 def have_to_expect?(project)
   EXCLUSION_PROJECT_IDS.include?(project.id) || 
     PROJECT_FOLDER_ID == project.id ||
-    colored?(project)
+    ng_colored?(project)
 end
 
-def colored?(project)
-  (![nil, 'none'].include?(project.color))
+def ng_colored?(project)
+  ['dark-brown', 'light-purple', 'light-warm-gray', nil, 'none'].include?(project.color)
 end
 
 def oldest_due_on
@@ -61,6 +66,40 @@ def update_data(project, index: 0, pre_task: {}, due_on: nil)
   data
 end
 
+def get_sections_in_project(client, project_id: )
+  client.get("/projects/#{project_id}/sections").body['data']
+end
+
+def add_subtasks_sections_in_this_project(task, project, client)
+  sections = get_sections_in_project(client, project_id: project.id)
+  pre_task = nil
+  sections.each do |section|
+    same_subtask = task.subtasks(client).find{|sub_t| section['id'] == sub_t.refresh.notes.to_s.strip.to_i}
+    if same_subtask.nil?
+      changed_subtask = client.tasks.create(name: section['name'].chop, notes: section['id'].to_s, workspace: $workspace.id)
+      changed_subtask.set_parent(parent: task.id, insert_after: pre_task&.id)
+      p "#{changed_subtask.name}は新しいsectionだったので新しくsubtask追加"
+    else
+      changed_subtask = same_subtask.update(name: section['name'].chop, notes: section['id'].to_s, workspace: $workspace.id)
+      p "#{changed_subtask.name}はすでにsubtaskにあったのでupdate"
+    end
+    pre_task = changed_subtask
+  end
+
+  delete_tasks = task.subtasks(client).reject do |task|
+    task = task.refresh
+    section_ids = sections.map{|section| section['id'] }
+    notes_id = task.notes.to_s.strip.to_i
+    section_ids.include?(notes_id)
+  end
+
+  delete_tasks.each do |task|
+    p "#{task.name}はいらないsubtaskなので削除"
+    task.delete
+  end
+
+end
+
 $workspace = client.workspaces.find_all.first
 target_project_folder = client.projects.find_by_id(PROJECT_FOLDER_ID)
 $tasks_in_project_folder = client.tasks.find_all(project: target_project_folder.id).map{|t| client.tasks.find_by_id(t.id)}
@@ -80,6 +119,7 @@ target_projects.each_with_index do |project, i|
     changed_task = same_task.update(update_data(project, index: i, pre_task: pre_task, due_on: same_task.due_on))
   end
   changed_task.add_project(project: target_project_folder.id, insert_after: pre_task&.id)
+  add_subtasks_sections_in_this_project(changed_task, project, client)
   pre_task = changed_task
 end
 
