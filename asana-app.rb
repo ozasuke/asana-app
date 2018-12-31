@@ -11,8 +11,10 @@ end
 
 module Asana::Resources
   class Project
-    def select_same_task(tasks)
-      tasks.find{|t| id == t.notes.strip.to_i}
+    def select_same_section(sections, client)
+      sections.find do |sec|
+        id == sec.notes.strip.to_i
+      end
     end
   end
 
@@ -30,6 +32,16 @@ module Asana::Resources
       Collection.new(parse(client.get("/tasks/#{id}/subtasks", params: params, options: options)), type: self.class, client: client)
     end
   end
+
+  class Section < Resource
+    def insert_in_project(project: required("project"), before_section: nil, after_section: nil, options: {}, **data)
+      with_params = data.merge(before_section: before_section, after_section: after_section).reject { |_,v| v.nil? || Array(v).empty? }
+      client = Asana::Client.new do |c|
+        c.authentication :access_token, ACCESS_TOKEN
+      end
+      client.post("/projects/#{project}/sections/insert", body: with_params, options: options) && true
+    end
+  end
 end
 
 def have_to_expect?(project)
@@ -39,29 +51,30 @@ def have_to_expect?(project)
 end
 
 def ng_colored?(project)
-  ['dark-brown', 'light-purple', 'light-warm-gray', nil, 'none'].include?(project.color)
+  ['dark-brown', 'light-purple', 'light-warm-gray', nil, 'none', 'light-orange'].include?(project.color)
 end
 
 def oldest_due_on
-  $tasks_in_project_folder.map(&:due_on).sort.first
+  nil
+  # $sections_in_project_folder.map(&:due_on).sort.first
 end
 
 def base_data(project, index: 0, due_on: oldest_due_on)
   num_str = "%02d" % (index + 1)
   {
-    name: "#{num_str}.#{project.name}",
+    name: "#{num_str}.#{project.name}:",
     notes: project.id.to_s,
-    due_on: due_on,
+    # due_on: due_on,
     workspace: $workspace.id,
   }
 end
 
 def create_data(project, index: 0, pre_task: {})
-  base_data(project, index: index, due_on: pre_task&.due_on)
+  base_data(project, index: index)
 end
 
 def update_data(project, index: 0, pre_task: {}, due_on: nil)
-  data = base_data(project, index: index, due_on: due_on || pre_task&.due_on)
+  data = base_data(project, index: index)
   data.delete(:projects)
   data
 end
@@ -70,23 +83,24 @@ def get_sections_in_project(client, project_id: )
   client.get("/projects/#{project_id}/sections").body['data']
 end
 
-def add_subtasks_sections_in_this_project(task, project, client)
+def add_tasks_sections_in_this_project(section, project, client, target_project_folder)
   sections = get_sections_in_project(client, project_id: project.id)
   pre_task = nil
-  sections.each do |section|
-    same_subtask = task.subtasks(client).find{|sub_t| section['id'] == sub_t.refresh.notes.to_s.strip.to_i}
-    if same_subtask.nil?
-      changed_subtask = client.tasks.create(name: section['name'].chop, notes: section['id'].to_s, workspace: $workspace.id)
-      changed_subtask.set_parent(parent: task.id, insert_after: pre_task&.id)
-      p "#{changed_subtask.name}は新しいsectionだったので新しくsubtask追加"
+  sections.each do |real_section|
+    same_task = $tasks_in_project_folder.find{|task| real_section['id'] == task.notes.to_s.strip.to_i }
+    if same_task.nil?
+      changed_task = client.tasks.create(name: real_section['name'].chop, notes: real_section['id'].to_s, workspace: $workspace.id)
+      opts = pre_task.nil? ? {section: section.id} : {insert_after: pre_task.id}
+      changed_task.add_project({project: target_project_folder.id}.merge(opts))
+      p "#{changed_task.name}は新しいsectionだったので新しくtask追加"
     else
-      changed_subtask = same_subtask.update(name: section['name'].chop, notes: section['id'].to_s, workspace: $workspace.id)
-      p "#{changed_subtask.name}はすでにsubtaskにあったのでupdate"
+      changed_task = same_task.update(name: real_section['name'].chop, notes: real_section['id'].to_s, workspace: $workspace.id)
+      p "#{changed_task.name}はすでにtaskにあったのでupdate"
     end
-    pre_task = changed_subtask
+    pre_task = changed_task
   end
-
-  delete_tasks = task.subtasks(client).reject do |task|
+  delete_tasks = $tasks_in_project_folder_with_sections.select{|task| section.id == task.memberships.first&.[]('section')&.[]('id') }.reject do |task|
+    return true  if task.name.end_with?(':')
     task = task.refresh
     section_ids = sections.map{|section| section['id'] }
     notes_id = task.notes.to_s.strip.to_i
@@ -102,35 +116,43 @@ end
 
 $workspace = client.workspaces.find_all.first
 target_project_folder = client.projects.find_by_id(PROJECT_FOLDER_ID)
-$tasks_in_project_folder = client.tasks.find_all(project: target_project_folder.id).map{|t| client.tasks.find_by_id(t.id)}
+opts = {fields: ['id', 'name', 'notes', 'color']}
+$sections_in_project_folder = client.sections.find_by_project(project: target_project_folder.id, options: opts)
+$sections_in_project_folder_with_note = $sections_in_project_folder.map{|sec| client.tasks.find_by_id(sec.id, options: {fields: ['notes']})}
+$tasks_in_project_folder = client.tasks.find_all(project: target_project_folder.id, options: opts)
+$tasks_in_project_folder_with_sections = client.tasks.find_all(project: target_project_folder.id, options: {expand: ['memberships']})
 
-all_projects = client.projects.find_all(workspace: $workspace.id, archived: false, per_page: 100)
-all_projects = all_projects.map{|p| client.projects.find_by_id(p.id)}
+all_projects = client.projects.find_all(workspace: $workspace.id, archived: false, per_page: 100, options: opts)
 target_projects = all_projects.reject{|p| have_to_expect?(p)}
 
-
 # 現在activeなプロジェクトをプロジェクトフォルダへcopy or update
-pre_task = nil
+pre_section = nil
 target_projects.each_with_index do |project, i|
-  same_task = project.select_same_task($tasks_in_project_folder)
-  if same_task.nil?
-    changed_task = client.tasks.create(create_data(project, index: i, pre_task: pre_task))
+  same_section = project.select_same_section($sections_in_project_folder_with_note, client)
+  if same_section.nil?
+    p "#{project.name}は新しいprojectだったので新規追加"
+    changed_section = client.sections.create_in_project({project: target_project_folder.id}.merge(create_data(project, index: i, pre_task: pre_section)))
   else
-    changed_task = same_task.update(update_data(project, index: i, pre_task: pre_task, due_on: same_task.due_on))
+    p "#{project.name}はすでにあるprojectだったので更新"
+    changed_section = same_section
   end
-  changed_task.add_project(project: target_project_folder.id, insert_after: pre_task&.id)
-  add_subtasks_sections_in_this_project(changed_task, project, client)
-  pre_task = changed_task
+  client.tasks.find_by_id(changed_section.id).update(update_data(project, index: i, pre_task: pre_section))
+  # 移動をサポートしたら下記でもOK
+  # opts = pre_section.nil? ? {before_section: $sections_in_project_folder.first.id} : {after_section: pre_section&.id}
+  # changed_section.insert_in_project({project: target_project_folder.id}.merge(opts)) unless changed_section.id == $sections_in_project_folder.first.id
+  add_tasks_sections_in_this_project(changed_section, project, client, target_project_folder)
+  pre_section = changed_section
 end
 
 # プロジェクトフォルダ内のいらないtaskを削除
-
-delete_tasks = $tasks_in_project_folder.reject do |task|
+delete_sections = $sections_in_project_folder.reject do |section|
   project_ids = target_projects.map(&:id)
-  notes_id = task.notes.strip.to_i
+  notes_id = client.tasks.find_by_id(section.id, options: {fields: ['notes']}).notes.strip.to_i
   project_ids.include?(notes_id)
 end
 
-delete_tasks.each do |task|
-  task.delete
+delete_sections.each do |section|
+  delete_tasks = $tasks_in_project_folder_with_sections.select{|task| section.id == task.memberships.first&.[]('section')&.[]('id') }
+  delete_tasks.each(&:delete)
+  section.delete
 end
