@@ -100,11 +100,14 @@ def add_tasks_sections_in_this_project(section, project, client, target_project_
     pre_task = changed_task
   end
   delete_tasks = $tasks_in_project_folder_with_sections.select{|task| section.id == task.memberships.first&.[]('section')&.[]('id') }.reject do |task|
-    return true  if task.name.end_with?(':')
-    task = task.refresh
-    section_ids = sections.map{|section| section['id'] }
-    notes_id = task.notes.to_s.strip.to_i
-    section_ids.include?(notes_id)
+    if task.name.end_with?(':')
+      true
+    else
+      task = task.refresh
+      section_ids = sections.map{|section| section['id'] }
+      notes_id = task.notes.to_s.strip.to_i
+      section_ids.include?(notes_id)
+    end
   end
 
   delete_tasks.each do |task|
